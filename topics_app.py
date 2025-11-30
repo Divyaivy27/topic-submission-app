@@ -99,89 +99,138 @@ def show_submission_count():
 # -------------------------
 # UI form
 # -------------------------
-with st.form("details_form", clear_on_submit=False):
-    st.subheader("Enter your details")
-    name = st.text_input("Name", help="Your full name")
-    regno = st.text_input(f"Register Number (must start with {REG_PREFIX}, last two digits 01–{REG_MAX_LAST})",
-                          help=f"Example: {REG_PREFIX}01")
-    rollno = st.text_input("Roll Number (must start with 23d12; forbidden suffixes: 08,29,13)",
-                           help="Example: 23d1201")
-    submitted_basic = st.form_submit_button("Continue →")
+# -------------------------
+# UI flow with session state (details -> topic -> confirmation)
+# -------------------------
+# initialize session state
+if "step" not in st.session_state:
+    st.session_state.step = "details"   # possible values: 'details', 'topic', 'confirm', 'done'
+if "name" not in st.session_state:
+    st.session_state.name = ""
+if "regno" not in st.session_state:
+    st.session_state.regno = ""
+if "rollno" not in st.session_state:
+    st.session_state.rollno = ""
+if "topic" not in st.session_state:
+    st.session_state.topic = ""
 
-if submitted_basic:
-    # Basic validations
-    if any(v.strip().lower() in ("exit", "quit") for v in (name, regno, rollno)):
-        st.warning("Exiting by user request.")
-        st.stop()
+def goto_topic():
+    st.session_state.step = "topic"
+    st.experimental_rerun()
 
-    ok = True
-    if not name.strip():
-        st.error("Name cannot be empty.")
-        ok = False
+def back_to_details():
+    st.session_state.step = "details"
+    st.experimental_rerun()
 
-    v_reg, msg_reg = validate_regno(regno.strip())
-    if not v_reg:
-        st.error(msg_reg)
-        ok = False
+def goto_confirm():
+    st.session_state.step = "confirm"
+    st.experimental_rerun()
 
-    v_roll, msg_roll = validate_rollno(rollno.strip())
-    if not v_roll:
-        st.error(msg_roll)
-        ok = False
+def finish_and_reset():
+    # optional: clear fields after done
+    st.session_state.step = "details"
+    st.session_state.name = ""
+    st.session_state.regno = ""
+    st.session_state.rollno = ""
+    st.session_state.topic = ""
+    st.experimental_rerun()
 
-    if not ok:
-        st.info("Fix the highlighted fields and press Continue → again.")
-        st.stop()
+# ---------- DETAILS STEP ----------
+if st.session_state.step == "details":
+    with st.form("details_form", clear_on_submit=False):
+        st.subheader("Enter your details")
+        name = st.text_input("Name", value=st.session_state.name, help="Your full name")
+        regno = st.text_input(f"Register Number (must start with {REG_PREFIX}, last two digits 01–{REG_MAX_LAST})",
+                              value=st.session_state.regno,
+                              help=f"Example: {REG_PREFIX}01")
+        rollno = st.text_input("Roll Number (must start with 23d12; forbidden suffixes: 08,29,13)",
+                               value=st.session_state.rollno,
+                               help="Example: 23d1201")
+        submitted_basic = st.form_submit_button("Continue →")
 
-    # All basic validations passed. Load existing to check regno existence.
-    df_existing = load_existing_df()
+    if submitted_basic:
+        # Basic validations
+        if any(v.strip().lower() in ("exit", "quit") for v in (name, regno, rollno)):
+            st.warning("Exiting by user request.")
+            st.stop()
+
+        ok = True
+        if not name.strip():
+            st.error("Name cannot be empty.")
+            ok = False
+
+        v_reg, msg_reg = validate_regno(regno.strip())
+        if not v_reg:
+            st.error(msg_reg)
+            ok = False
+
+        v_roll, msg_roll = validate_rollno(rollno.strip())
+        if not v_roll:
+            st.error(msg_roll)
+            ok = False
+
+        if not ok:
+            st.info("Fix the highlighted fields and press Continue → again.")
+            st.stop()
+
+        # store validated values in session_state and move to topic step
+        st.session_state.name = name.strip()
+        st.session_state.regno = regno.strip()
+        st.session_state.rollno = rollno.strip()
+        goto_topic()
+
+# ---------- TOPIC STEP ----------
+elif st.session_state.step == "topic":
+    # show existing submission info (if any)
+    df_existing = load_sheet_df()
     reg_exists = False
     existing_topic = None
     if df_existing is not None and "Register Number" in df_existing.columns:
-        matches = df_existing[df_existing["Register Number"] == regno.strip()]
+        matches = df_existing[df_existing["Register Number"] == st.session_state.regno]
         if not matches.empty:
             reg_exists = True
             existing_topic = matches.iloc[-1].get("Topic", None)
 
     if reg_exists:
-        st.warning(f"A submission already exists for Register Number {regno.strip()}.")
+        st.warning(f"A submission already exists for Register Number {st.session_state.regno}.")
         if existing_topic:
             st.write("Previously submitted Topic:")
             st.write(f"> {existing_topic}")
-        edit_choice = st.radio("Do you want to edit the Topic for this Register Number?", ("No — keep as is", "Yes — edit topic"))
+        edit_choice = st.radio("Do you want to edit the Topic for this Register Number?",
+                               ("No — keep as is", "Yes — edit topic"))
         if edit_choice == "No — keep as is":
             show_submission_count()
             st.success("No changes made.")
             st.stop()
-        # else continue to topic entry with ability to overwrite
 
-    # Topic entry & similarity check form
     with st.form("topic_form", clear_on_submit=False):
         st.subheader("Enter Topic")
-        topic = st.text_input("Topic", help="Example: Basic Fabrication steps - Photolithography, Etching")
+        topic = st.text_input("Topic", value=st.session_state.topic, help="Example: Basic Fabrication steps - Photolithography, Etching")
         topic_submit = st.form_submit_button("Check & Continue")
+        back = st.form_submit_button("Back")
+
+    if back:
+        # go back to details step (values remain in session_state)
+        back_to_details()
 
     if topic_submit:
         if not topic.strip():
             st.error("Topic cannot be empty.")
             st.stop()
 
-        # Build topics to check excluding same RegNo
+        # check similarity excluding same reg no
         topics_to_check = []
-        df_check = load_existing_df()
+        df_check = load_sheet_df()
         if df_check is not None and "Topic" in df_check.columns:
             if "Register Number" in df_check.columns:
                 df_check["Register Number"] = df_check["Register Number"].astype(str)
-                topics_to_check = df_check[df_check["Register Number"] != regno.strip()]["Topic"].astype(str).tolist()
+                topics_to_check = df_check[df_check["Register Number"] != st.session_state.regno]["Topic"].astype(str).tolist()
             else:
                 topics_to_check = df_check["Topic"].astype(str).tolist()
 
         similar_list = []
         for t in topics_to_check:
-            if (t.lower() == topic.lower()
-                or topic.lower() in t.lower()
-                or t.lower() in topic.lower()
-                or is_similar(topic, t)):
+            if (t.lower() == topic.lower() or topic.lower() in t.lower() or t.lower() in topic.lower() or is_similar(topic, t)):
                 similar_list.append(t)
 
         if similar_list:
@@ -192,67 +241,79 @@ if submitted_basic:
             if change_choice == "Yes — change topic":
                 st.info("Please edit the Topic above and press Check & Continue again.")
                 st.stop()
-            # else proceed to final confirmation
 
-        # Final confirmation (display details and save)
-        st.write("---")
-        st.subheader("Final confirmation")
-        st.write("**Name:**", name)
-        st.write("**Register Number:**", regno)
-        st.write("**Roll Number:**", rollno)
-        st.write("**Topic:**", topic)
+        # save topic to session and go to confirm
+        st.session_state.topic = topic.strip()
+        goto_confirm()
 
-        save = st.button("Save to list ✅")
-        edit_final = st.button("Edit fields ❌")
+# ---------- CONFIRM STEP ----------
+elif st.session_state.step == "confirm":
+    st.subheader("Final confirmation")
+    st.write("**Name:**", st.session_state.name)
+    st.write("**Register Number:**", st.session_state.regno)
+    st.write("**Roll Number:**", st.session_state.rollno)
+    st.write("**Topic:**", st.session_state.topic)
 
-        if edit_final:
-            st.info("Please modify Name / Register Number / Roll Number / Topic above using the forms and press the appropriate Continue buttons.")
-            st.stop()
+    save = st.button("Save to list ✅")
+    edit_final = st.button("Edit fields ❌")
+    back_btn = st.button("Back")
 
-        if save:
-            timestamp = datetime.now().isoformat(sep=" ", timespec="seconds")
-            data = {
-                "Name": [name.strip()],
-                "Register Number": [regno.strip()],
-                "Roll Number": [rollno.strip()],
-                "Topic": [topic.strip()],
-                "Timestamp": [timestamp]
-            }
-            df_new = pd.DataFrame(data)
+    if back_btn:
+        st.session_state.step = "topic"
+        st.experimental_rerun()
 
-            if os.path.exists(FILE):
-                try:
-                    df_existing = pd.read_excel(FILE)
-                except Exception:
-                    st.warning("Could not read existing file; creating a new one.")
-                    df_existing = pd.DataFrame(columns=df_new.columns)
+    if edit_final:
+        # allow user to go back and edit details
+        st.session_state.step = "details"
+        st.experimental_rerun()
 
-                # normalize previous column name differences
-                if "Topic Title" in df_existing.columns and "Topic" not in df_existing.columns:
-                    df_existing = df_existing.rename(columns={"Topic Title": "Topic"})
+    if save:
+        # prepare df_new
+        timestamp = datetime.now().isoformat(sep=" ", timespec="seconds")
+        data = {
+            "Name": [st.session_state.name],
+            "Register Number": [st.session_state.regno],
+            "Roll Number": [st.session_state.rollno],
+            "Topic": [st.session_state.topic],
+            "Timestamp": [timestamp]
+        }
+        df_new = pd.DataFrame(data)
 
-                if "Register Number" in df_existing.columns:
-                    df_existing["Register Number"] = df_existing["Register Number"].astype(str)
+        # load existing and merge (remove existing RegNo if present)
+        existing = load_sheet_df()
+        if existing is not None:
+            if "Topic Title" in existing.columns and "Topic" not in existing.columns:
+                existing = existing.rename(columns={"Topic Title": "Topic"})
+            if "Register Number" in existing.columns:
+                existing["Register Number"] = existing["Register Number"].astype(str)
+                if (existing["Register Number"] == st.session_state.regno).any():
+                    existing = existing[existing["Register Number"] != st.session_state.regno]
+            if "Timestamp" not in existing.columns:
+                existing["Timestamp"] = pd.NA
+            df_final = pd.concat([existing, df_new], ignore_index=True)
+        else:
+            df_final = df_new
 
-                # remove previous entries for this RegNo
-                if "Register Number" in df_existing.columns and (df_existing["Register Number"] == regno.strip()).any():
-                    df_existing = df_existing[df_existing["Register Number"] != regno.strip()]
+        # save to Google Sheets
+        success = save_df_to_sheet(df_final)
+        if success:
+            st.success("✔️ Your response has been saved successfully!")
+            st.info(f"📊 Total students submitted: {len(df_final)}")
+            # optionally reset or allow another submission
+            finish_and_reset()
+        else:
+            st.error("Failed to save. Please tell the admin.")
 
-                if "Timestamp" not in df_existing.columns:
-                    df_existing["Timestamp"] = pd.NA
+# ---------- DONE (post-save) ----------
+elif st.session_state.step == "done":
+    st.success("Thank you — submission complete.")
+    st.write("If you want to submit again, use the form below.")
+    # show current values cleared; allow a manual reset button
+    if st.button("New submission"):
+        finish_and_reset()
 
-                df_final = pd.concat([df_existing, df_new], ignore_index=True)
-            else:
-                df_final = df_new
-
-            # Save (with backup)
-            try:
-                save_df(df_final)
-                st.success("✔️ Your response has been saved successfully!")
-                total = len(df_final)
-                st.info(f"📊 Total students submitted so far: {total}")
-            except Exception as e:
-                st.error("Error saving data. Tell the admin. (" + str(e) + ")")
+# sidebar status
+show_submission_count()
 
 # show submission count in the sidebar always
 st.sidebar.header("Status")
