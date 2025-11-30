@@ -1,110 +1,120 @@
 # topics_app.py
+# Streamlit app: Topic Submission using Google Sheets backend
+# Requirements: streamlit, pandas, gspread, gspread-dataframe, oauth2client
+
 import streamlit as st
 import pandas as pd
-import os
 import re
-import sys
+import json
 from datetime import datetime
 from difflib import SequenceMatcher
-import shutil
+import gspread
+from gspread_dataframe import set_with_dataframe
 
-# ---------- CONFIG ----------
-DESKTOP_PATH = os.path.join(os.path.expanduser("~"), "Desktop")
-FILE = os.path.join(DESKTOP_PATH, "topics.xlsx")   # saved on Desktop (hidden from users)
-BACKUP_FOLDER = os.path.join(DESKTOP_PATH, "topic_backups")
+# ================= CONFIG =================
 SIMILARITY_THRESHOLD = 0.5
 REG_PREFIX = "23130910831"
 REG_MAX_LAST = 48
 FORBIDDEN_ROLL_SUFFIX = {"08", "29", "13"}
-# ----------------------------
+WORKSHEET_NAME = "Submissions"  # sheet tab name in Google Sheets
+# ==========================================
 
 st.set_page_config(page_title="Topic Submission", page_icon="📝", layout="centered")
-
 st.title("Topic Submission Form")
-st.caption("Fill your details and choose a topic. Use the form below. (Type `exit` in a field to stop — not needed in browser.)")
+st.caption("Fill your details and choose a topic. Submissions are saved to a Google Sheet.")
 
-# -------------------------
-# Helpers
-# -------------------------
+# ---------------- Helpers -----------------
 def is_similar(a: str, b: str, threshold=SIMILARITY_THRESHOLD) -> bool:
     return SequenceMatcher(None, a.lower(), b.lower()).ratio() >= threshold
 
-def ensure_backup_folder():
-    os.makedirs(BACKUP_FOLDER, exist_ok=True)
+def gspread_client_from_secrets():
+    """
+    Create a gspread client using the JSON in st.secrets['gcp_service_account_key'].
+    The secret should contain the full JSON (as an object or string).
+    """
+    raw = st.secrets["gcp_service_account_key"]
+    # If secret value is a string (the JSON text) parse it, otherwise assume it's already a dict
+    if isinstance(raw, str):
+        sa_info = json.loads(raw)
+    else:
+        sa_info = raw
+    return gspread.service_account_from_dict(sa_info)
 
-def backup_file_if_exists():
-    """Create a timestamped backup of FILE if it exists."""
-    if os.path.exists(FILE):
-        ensure_backup_folder()
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_name = f"topics_backup_{ts}.xlsx"
-        backup_path = os.path.join(BACKUP_FOLDER, backup_name)
-        shutil.copy2(FILE, backup_path)
-
-def load_existing_df():
-    if os.path.exists(FILE):
-        try:
-            df = pd.read_excel(FILE)
-            # normalize column names for safety: prefer "Topic"
-            if "Topic Title" in df.columns and "Topic" not in df.columns:
-                df = df.rename(columns={"Topic Title": "Topic"})
-            # ensure register numbers are strings
-            if "Register Number" in df.columns:
-                df["Register Number"] = df["Register Number"].astype(str)
-            return df
-        except Exception:
-            st.warning("Warning: Could not read the existing Excel file. Proceeding as if none exist.")
-            return None
-    return None
-
-def save_df(df: pd.DataFrame):
-    # sort by register number numerically if possible
+def load_sheet_df():
+    """Return DataFrame from the Google Sheet (worksheet WORKSHEET_NAME) or None."""
     try:
-        df["Register Number"] = df["Register Number"].astype(str)
-        df = df.assign(_reg_sort = df["Register Number"].astype(int)).sort_values(by="_reg_sort")
-        df = df.drop(columns=["_reg_sort"])
-    except Exception:
-        df = df.sort_values(by="Register Number")
-    # backup before writing
-    backup_file_if_exists()
-    df.to_excel(FILE, index=False)
+        gc = gspread_client_from_secrets()
+        sh = gc.open_by_key(st.secrets["sheet_id"])
+        try:
+            ws = sh.worksheet(WORKSHEET_NAME)
+        except gspread.WorksheetNotFound:
+            # create worksheet if not exists (empty)
+            ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=1000, cols=20)
+            return None
+        data = ws.get_all_records()
+        if not data:
+            return None
+        df = pd.DataFrame(data)
+        # prefer consistent column name "Topic"
+        if "Topic Title" in df.columns and "Topic" not in df.columns:
+            df = df.rename(columns={"Topic Title": "Topic"})
+        if "Register Number" in df.columns:
+            df["Register Number"] = df["Register Number"].astype(str)
+        return df
+    except Exception as e:
+        st.error("Error reading Google Sheet: " + str(e))
+        return None
 
-def validate_regno(r: str) -> tuple[bool, str]:
+def save_df_to_sheet(df: pd.DataFrame) -> bool:
+    """Overwrite the worksheet with df (header + rows). Returns True on success."""
+    try:
+        gc = gspread_client_from_secrets()
+        sh = gc.open_by_key(st.secrets["sheet_id"])
+        try:
+            ws = sh.worksheet(WORKSHEET_NAME)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=1000, cols=20)
+        # Ensure Register Number column is string to avoid formatting issues
+        if "Register Number" in df.columns:
+            df["Register Number"] = df["Register Number"].astype(str)
+        set_with_dataframe(ws, df)  # writes header + data
+        return True
+    except Exception as e:
+        st.error("Error saving to Google Sheet: " + str(e))
+        return False
+
+def validate_regno(r: str):
     if not re.fullmatch(r"\d{13}", r):
         return False, "Register number must be exactly 13 digits."
     if not r.startswith(REG_PREFIX):
         return False, f"Register must start with {REG_PREFIX}."
     try:
         last = int(r[-2:])
-    except ValueError:
-        return False, "Last two characters of Register number must be digits."
+    except Exception:
+        return False, "Last two characters must be digits."
     if not (1 <= last <= REG_MAX_LAST):
         return False, f"Last two digits must be between 01 and {REG_MAX_LAST}."
     return True, ""
 
-def validate_rollno(r: str) -> tuple[bool, str]:
+def validate_rollno(r: str):
+    # case-insensitive on 'd' (accept D or d)
     m = re.fullmatch(r"^23d12(\d{2})$", r, re.I)
     if not m:
-        return False, "Roll format must start with 23d12 followed by two digits (e.g. 23d1201)."
+        return False, "Roll format must start with 23d12 (d or D) followed by two digits (e.g. 23d1201)."
     suffix = m.group(1)
     if suffix in FORBIDDEN_ROLL_SUFFIX:
-        return False, f"Roll suffix {suffix} is reserved (TC students) — pick a different roll suffix."
+        return False, f"Roll suffix {suffix} is reserved (TC students). Choose another suffix."
     return True, ""
 
 def show_submission_count():
-    df = load_existing_df()
+    df = load_sheet_df()
     total = len(df) if df is not None else 0
-    st.info(f"📊 Total students submitted so far: {total}")
+    st.sidebar.info(f"📊 Total submissions: {total}")
 
-# -------------------------
-# UI form
-# -------------------------
-# -------------------------
-# UI flow with session state (details -> topic -> confirmation)
-# -------------------------
+# ---------------- Session-state UI flow ----------------
 # initialize session state
 if "step" not in st.session_state:
-    st.session_state.step = "details"   # possible values: 'details', 'topic', 'confirm', 'done'
+    st.session_state.step = "details"   # values: 'details', 'topic', 'confirm', 'done'
 if "name" not in st.session_state:
     st.session_state.name = ""
 if "regno" not in st.session_state:
@@ -116,24 +126,23 @@ if "topic" not in st.session_state:
 
 def goto_topic():
     st.session_state.step = "topic"
-    st.experimental_rerun()
+    st.rerun()
 
 def back_to_details():
     st.session_state.step = "details"
-    st.experimental_rerun()
+    st.rerun()
 
 def goto_confirm():
     st.session_state.step = "confirm"
-    st.experimental_rerun()
+    st.rerun()
 
 def finish_and_reset():
-    # optional: clear fields after done
     st.session_state.step = "details"
     st.session_state.name = ""
     st.session_state.regno = ""
     st.session_state.rollno = ""
     st.session_state.topic = ""
-    st.experimental_rerun()
+    st.rerun()
 
 # ---------- DETAILS STEP ----------
 if st.session_state.step == "details":
@@ -151,29 +160,26 @@ if st.session_state.step == "details":
     if submitted_basic:
         # Basic validations
         if any(v.strip().lower() in ("exit", "quit") for v in (name, regno, rollno)):
-            st.warning("Exiting by user request.")
+            st.warning("Exit requested. Nothing saved.")
             st.stop()
 
         ok = True
         if not name.strip():
             st.error("Name cannot be empty.")
             ok = False
-
         v_reg, msg_reg = validate_regno(regno.strip())
         if not v_reg:
             st.error(msg_reg)
             ok = False
-
         v_roll, msg_roll = validate_rollno(rollno.strip())
         if not v_roll:
             st.error(msg_roll)
             ok = False
-
         if not ok:
-            st.info("Fix the highlighted fields and press Continue → again.")
+            st.info("Fix the fields and press Continue → again.")
             st.stop()
 
-        # store validated values in session_state and move to topic step
+        # persist and go to topic
         st.session_state.name = name.strip()
         st.session_state.regno = regno.strip()
         st.session_state.rollno = rollno.strip()
@@ -196,8 +202,7 @@ elif st.session_state.step == "topic":
         if existing_topic:
             st.write("Previously submitted Topic:")
             st.write(f"> {existing_topic}")
-        edit_choice = st.radio("Do you want to edit the Topic for this Register Number?",
-                               ("No — keep as is", "Yes — edit topic"))
+        edit_choice = st.radio("Do you want to edit the Topic for this Register Number?", ("No — keep as is", "Yes — edit topic"))
         if edit_choice == "No — keep as is":
             show_submission_count()
             st.success("No changes made.")
@@ -210,7 +215,6 @@ elif st.session_state.step == "topic":
         back = st.form_submit_button("Back")
 
     if back:
-        # go back to details step (values remain in session_state)
         back_to_details()
 
     if topic_submit:
@@ -242,7 +246,6 @@ elif st.session_state.step == "topic":
                 st.info("Please edit the Topic above and press Check & Continue again.")
                 st.stop()
 
-        # save topic to session and go to confirm
         st.session_state.topic = topic.strip()
         goto_confirm()
 
@@ -260,15 +263,13 @@ elif st.session_state.step == "confirm":
 
     if back_btn:
         st.session_state.step = "topic"
-        st.experimental_rerun()
+        st.rerun()
 
     if edit_final:
-        # allow user to go back and edit details
         st.session_state.step = "details"
-        st.experimental_rerun()
+        st.rerun()
 
     if save:
-        # prepare df_new
         timestamp = datetime.now().isoformat(sep=" ", timespec="seconds")
         data = {
             "Name": [st.session_state.name],
@@ -282,6 +283,7 @@ elif st.session_state.step == "confirm":
         # load existing and merge (remove existing RegNo if present)
         existing = load_sheet_df()
         if existing is not None:
+            # normalize previous column name differences
             if "Topic Title" in existing.columns and "Topic" not in existing.columns:
                 existing = existing.rename(columns={"Topic Title": "Topic"})
             if "Register Number" in existing.columns:
@@ -294,12 +296,10 @@ elif st.session_state.step == "confirm":
         else:
             df_final = df_new
 
-        # save to Google Sheets
         success = save_df_to_sheet(df_final)
         if success:
             st.success("✔️ Your response has been saved successfully!")
             st.info(f"📊 Total students submitted: {len(df_final)}")
-            # optionally reset or allow another submission
             finish_and_reset()
         else:
             st.error("Failed to save. Please tell the admin.")
@@ -307,19 +307,8 @@ elif st.session_state.step == "confirm":
 # ---------- DONE (post-save) ----------
 elif st.session_state.step == "done":
     st.success("Thank you — submission complete.")
-    st.write("If you want to submit again, use the form below.")
-    # show current values cleared; allow a manual reset button
     if st.button("New submission"):
         finish_and_reset()
 
 # sidebar status
 show_submission_count()
-
-# show submission count in the sidebar always
-st.sidebar.header("Status")
-try:
-    df_now = load_existing_df()
-    total_now = len(df_now) if df_now is not None else 0
-    st.sidebar.write(f"Total submissions: {total_now}")
-except Exception:
-    st.sidebar.write("Total submissions: —")
